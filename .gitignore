@@ -1,0 +1,28 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Database and payloads (generated during tests)
+audit.db
+payloads.jsonl
+
+# Test artifacts
+*.log
+.pytest_cache/
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db
