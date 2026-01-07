@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+"""run_tests
+One-command test runner for the enhancement exercise.
+"""
+import builtins
+import json
+import os
+import sqlite3
+import statistics
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from hashlib import sha256
+from typing import Any, Dict, List, Tuple
+
+import audit_log_service
+import enhanced_audit_service
+import runner as bench_runner
+
+# --- Helpers ---------------------------------------------------------------
+
+class FileOpLogger:
+    """Context manager that wraps builtin open to log seek/read operations."""
+
+    def __init__(self):
+        self._orig_open = builtins.open
+        self.lock = threading.Lock()
+        self.operations: List[Tuple[str, int, int]] = []  # (op, arg1, arg2)
+
+    class _WrappedFile:
+        def __init__(self, f, logger: "FileOpLogger"):
+            self._f = f
+            self._logger = logger
+
+        def seek(self, offset, whence=0):
+            with self._logger.lock:
+                self._logger.operations.append(("seek", offset, whence))
+            return self._f.seek(offset, whence)
+
+        def read(self, length=-1):
+            with self._logger.lock:
+                self._logger.operations.append(("read", int(length), -1))
+            return self._f.read(length)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            try:
+                self._f.close()
+            finally:
+                return False
+
+    def _open(self, file, mode="rb", *args, **kwargs):
+        # Only wrap binary reads; delegate other opens to original
+        f = self._orig_open(file, mode, *args, **kwargs)
+        return FileOpLogger._WrappedFile(f, self)
+
+    def __enter__(self):
+        builtins.open = self._open
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        builtins.open = self._orig_open
+        return False
+
+
+def baseline_integrity_check() -> None:
+    # Ensure baseline files still have the BASELINE marker
+    for fname in ["audit_log_service.py", "runner.py"]:
+        with open(fname, "r", encoding="utf-8") as f:
+            content = f.read()
+            if "BASELINE — DO NOT EDIT" not in content and "BASELINE - DO NOT EDIT" not in content:
+                print(f"Baseline integrity check failed: {fname} missing BASELINE marker")
+                sys.exit(2)
+    print("✅ Baseline integrity markers present.")
+
+
+def get_payload_meta(event_ids: List[int]) -> Dict[int, Tuple[int, int]]:
+    conn = sqlite3.connect(audit_log_service.DB_PATH, check_same_thread=False)
+    cur = conn.cursor()
+    q = f"SELECT id, payload_offset, payload_len FROM audit_events WHERE id IN ({','.join('?' for _ in event_ids)})"
+    cur.execute(q, event_ids)
+    rows = cur.fetchall()
+    conn.close()
+    return {r[0]: (r[1], r[2]) for r in rows}
+
+
+# Semantic equivalence tests -------------------------------------------------
+
+def semantic_checks(samples: int = 200) -> None:
+    print(f"⏱ Running {samples} semantic equivalence checks...")
+    audit_log_service.init()
+    enhanced_audit_service.init()
+
+    for i in range(samples):
+        # Get a baseline result (this also gives us the query used)
+        baseline_res = audit_log_service.handle_request()
+        qdict = baseline_res["query"]
+        # Query enhanced service with same query
+        enhanced_res = enhanced_audit_service.query_with_params(qdict)
+
+        # Basic structure
+        if baseline_res["count"] != enhanced_res["count"]:
+            print("Mismatch count on sample", i)
+            print(baseline_res["count"], enhanced_res["count"])
+            sys.exit(3)
+
+        b_events = baseline_res["events"]
+        e_events = enhanced_res["events"]
+
+        if len(b_events) != len(e_events):
+            print("Event length mismatch on sample", i)
+            sys.exit(4)
+
+        # Ensure exact per-field equality
+        for be, ee in zip(b_events, e_events):
+            if be != ee:
+                print("Event mismatch on sample", i)
+                print("Baseline event:", be)
+                print("Enhanced event:", ee)
+                sys.exit(5)
+
+    print("✅ Semantic equivalence checks passed.")
+
+
+# Payload disk-read verification ---------------------------------------------
+
+def payload_read_checks(samples: int = 100) -> None:
+    print(f"🔍 Verifying payload seek+read per returned event ({samples} samples)...")
+    audit_log_service.init()
+    enhanced_audit_service.init()
+
+    for i in range(samples):
+        # Baseline
+        with FileOpLogger() as flog:
+            res = audit_log_service.handle_request()
+            ids = [e["id"] for e in res["events"]]
+            meta = get_payload_meta(ids)
+            # For each id, assert we saw a seek to offset and a read length matching payload_len
+            for eid in ids:
+                off, ln = meta[eid]
+                # Find a seek with offset and a read with length ln
+                seeks = [o for o in flog.operations if o[0] == "seek" and o[1] == off]
+                reads = [o for o in flog.operations if o[0] == "read" and o[1] == ln]
+                if not seeks or not reads:
+                    print(f"Baseline payload read missing for id {eid} on sample {i}")
+                    print("operations:", flog.operations)
+                    sys.exit(6)
+
+        # Enhanced
+        with FileOpLogger() as flog:
+            baseline_res = audit_log_service.handle_request()
+            qdict = baseline_res["query"]
+            res = enhanced_audit_service.query_with_params(qdict)
+            ids = [e["id"] for e in res["events"]]
+            meta = get_payload_meta(ids)
+            for eid in ids:
+                off, ln = meta[eid]
+                seeks = [o for o in flog.operations if o[0] == "seek" and o[1] == off]
+                reads = [o for o in flog.operations if o[0] == "read" and o[1] == ln]
+                if not seeks or not reads:
+                    print(f"Enhanced payload read missing for id {eid} on sample {i}")
+                    print("operations:", flog.operations)
+                    sys.exit(7)
+
+    print("✅ Payload disk-read checks passed.")
+
+
+# Concurrency correctness checks --------------------------------------------
+
+def concurrency_checks(concurrency: int = 32, per_thread: int = 25) -> None:
+    print(f"🧵 Running concurrency correctness with {concurrency} threads x {per_thread} ops...")
+    audit_log_service.init()
+    enhanced_audit_service.init()
+
+    # Pre-generate queries deterministically using Random(1337)
+    import random
+
+    rng = random.Random(1337)
+    now = int(time.time())
+
+    def make_query():
+        return {
+            "from_ts": now - 7 * 24 * 3600,
+            "to_ts": now,
+            "actor_id": rng.choice([None, rng.randint(1, 2000)]),
+            "action": rng.choice([None, "UPDATE", "CREATE", "DELETE"]),
+            "page": rng.randint(1, 2000),
+            "page_size": rng.choice([10, 20, 50]),
+        }
+
+    queries = [make_query() for _ in range(concurrency * per_thread)]
+
+    def worker(qs: List[Dict[str, Any]]):
+        for q in qs:
+            baseline_res = audit_log_service.handle_request()
+            # Use baseline's query dict to compare
+            qdict = baseline_res["query"]
+            enhanced_res = enhanced_audit_service.query_with_params(qdict)
+            if baseline_res["events"] != enhanced_res["events"]:
+                print("Concurrency correctness mismatch")
+                print(baseline_res["events"][:3])
+                print(enhanced_res["events"][:3])
+                sys.exit(8)
+
+    # Partition queries equally
+    chunk_size = per_thread
+    chunks = [queries[i : i + chunk_size] for i in range(0, len(queries), chunk_size)]
+
+    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+        futs = [ex.submit(worker, c) for c in chunks]
+        for fut in as_completed(futs):
+            fut.result()
+
+    print("✅ Concurrency correctness checks passed.")
+
+
+# Performance benchmarking --------------------------------------------------
+
+def baseline_query_executor(qdict: Dict[str, Any]) -> None:
+    # Emulate baseline SQL with LIMIT/OFFSET and per-row seek+read
+    conn = sqlite3.connect(audit_log_service.DB_PATH, check_same_thread=False)
+    cur = conn.cursor()
+    offset_rows = (qdict["page"] - 1) * qdict["page_size"]
+    cur.execute(
+        """
+        SELECT id, created_at, actor_id, action, resource_type, resource_id,
+               payload_offset, payload_len
+        FROM audit_events
+        WHERE created_at BETWEEN ? AND ?
+          AND (? IS NULL OR actor_id = ?)
+          AND (? IS NULL OR action = ?)
+        ORDER BY created_at DESC, id DESC
+        LIMIT ? OFFSET ?
+        """,
+        (
+            qdict["from_ts"],
+            qdict["to_ts"],
+            qdict["actor_id"],
+            qdict["actor_id"],
+            qdict["action"],
+            qdict["action"],
+            qdict["page_size"],
+            offset_rows,
+        ),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    # Read payloads
+    for r in rows:
+        off, ln = r[6], r[7]
+        with open(audit_log_service.PAYLOAD_FILE, "rb") as f:
+            f.seek(off)
+            _ = f.read(ln)
+
+
+def benchmark(concurrency: int = 32, total: int = 300) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    print(f"⚡ Benchmarking baseline and enhanced: concurrency={concurrency}, total={total}")
+
+    # Pre-generate deterministic queries using Random(1337)
+    import random
+
+    rng = random.Random(1337)
+    now = int(time.time())
+
+    def make_query():
+        return {
+            "from_ts": now - 7 * 24 * 3600,
+            "to_ts": now,
+            "actor_id": rng.choice([None, rng.randint(1, 2000)]),
+            "action": rng.choice([None, "UPDATE", "CREATE", "DELETE"]),
+            "page": rng.randint(1, 2000),
+            "page_size": rng.choice([10, 20, 50]),
+        }
+
+    queries = [make_query() for _ in range(total)]
+
+    # Runner expects a load_fn returning (t0, t1)
+    q_iter_lock = threading.Lock()
+    q_index = {"i": 0}
+
+    def baseline_load():
+        with q_iter_lock:
+            i = q_index["i"]
+            q_index["i"] = (i + 1) % len(queries)
+        q = queries[i]
+        t0 = time.perf_counter()
+        baseline_query_executor(q)
+        t1 = time.perf_counter()
+        return t0, t1
+
+    metrics_base = bench_runner.run(baseline_load, warmup=10, total=total, concurrency=concurrency)[0]
+
+    # For enhanced, reset iterator
+    q_index["i"] = 0
+
+    def enhanced_load():
+        with q_iter_lock:
+            i = q_index["i"]
+            q_index["i"] = (i + 1) % len(queries)
+        q = queries[i]
+        t0 = time.perf_counter()
+        enhanced_audit_service.query_with_params(q)
+        t1 = time.perf_counter()
+        return t0, t1
+
+    metrics_enh = bench_runner.run(enhanced_load, warmup=10, total=total, concurrency=concurrency)[0]
+
+    print("Baseline metrics:", metrics_base)
+    print("Enhanced metrics:", metrics_enh)
+
+    return metrics_base, metrics_enh
+
+
+def performance_gates():
+    # Median-of-3 runs at concurrency 32
+    runs = []
+    base_runs = []
+    enh_runs = []
+    for r in range(3):
+        print(f"Benchmark run {r+1}/3...")
+        mb, me = benchmark(concurrency=32, total=300)
+        base_runs.append(mb)
+        enh_runs.append(me)
+
+    def median_metric(runs_list, key):
+        return statistics.median([r[key] for r in runs_list])
+
+    base_p99 = median_metric(base_runs, "p99_ms")
+    base_rps = median_metric(base_runs, "rps")
+    enh_p99 = median_metric(enh_runs, "p99_ms")
+    enh_rps = median_metric(enh_runs, "rps")
+
+    print("--- Performance medians ---")
+    print(f"baseline p99: {base_p99:.3f} ms, rps: {base_rps:.3f}")
+    print(f"enhanced p99: {enh_p99:.3f} ms, rps: {enh_rps:.3f}")
+
+    # Gates
+    if not (enh_p99 <= 0.8 * base_p99):
+        print("Performance gate failed: enhanced p99 not <= 0.8 * baseline p99")
+        sys.exit(9)
+    if not (enh_rps >= 1.2 * base_rps):
+        print("Performance gate failed: enhanced RPS not >= 1.2 * baseline RPS")
+        sys.exit(10)
+
+    print("✅ Performance gates passed.")
+
+
+# --- Main ------------------------------------------------------------------
+
+def main():
+    print("GitHub Copilot — Running tests (OSWE VS Code Prime (Preview))")
+
+    baseline_integrity_check()
+
+    print("Setting up environment (seeding DB/payloads if needed)...")
+    audit_log_service.init()
+    enhanced_audit_service.init()
+    print("Environment ready.")
+
+    semantic_checks(samples=200)
+    payload_read_checks(samples=100)
+    concurrency_checks(concurrency=32, per_thread=10)
+    performance_gates()
+
+    # If we reach here, all checks passed
+    print("\nAll checks passed successfully! ✅")
+    # Print brief result summary
+    mb, me = benchmark(concurrency=32, total=300)
+    print("Final baseline metrics:", mb)
+    print("Final enhanced metrics:", me)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit as e:
+        raise
+    except Exception as e:
+        print("ERROR:", e)
+        sys.exit(1)
