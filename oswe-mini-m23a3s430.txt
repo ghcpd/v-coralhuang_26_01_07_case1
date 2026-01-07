@@ -1,0 +1,220 @@
+User: ### **Enhancement – Improve Efficiency and Robustness of an Existing Backend Feature (Implementation Required)**
+
+#### Fixed Baseline Contract (Read Carefully)
+
+Baseline behavior is defined by the immutable files:
+
+* `audit_log_service.py`
+* `runner.py`
+
+You **must not modify** them in any way (byte-for-byte integrity will be verified).
+
+Baseline characteristics:
+
+* Uses **OFFSET-based pagination**
+* Stores payloads in a **single disk-backed JSONL file**
+* For each returned event:
+
+  * disk **seek + read**
+  * **JSON decode**
+* Sort order (must be preserved exactly):
+
+```
+created_at DESC, id DESC
+```
+
+Required fields per event (must match exactly):
+`id, created_at, actor_id, action, resource_type, resource_id, payload`
+
+**Payload read contract (strict):**
+
+For every returned event, the implementation must perform a real file seek + read using its `(payload_offset, payload_len)` and JSON decode. Returning payloads from cached payload bytes or decoded objects is forbidden.
+
+---
+
+#### Dataset & Query Distribution (Do Not Change)
+
+* Rows: **50,000**
+* Page range: `page ∈ [1, 2000]`
+* Page size: `{10, 20, 50}`
+* Payload size: JSON with a 256–1024 char text field
+* Payloads must be read from disk for each returned event
+
+The dataset must not be regenerated or reshaped.
+
+---
+
+#### Your Task
+
+Enhance the existing implementation to improve **execution efficiency** and **robustness under concurrency**, while **strictly preserving semantics**.
+
+This is an **enhancement** task. You may add new files or entrypoints, but must not rewrite baseline files.
+
+Typical directions (non-exhaustive):
+
+* Cursor / keyset pagination (must remain semantically equivalent under this immutable dataset)
+* More efficient query patterns
+* Improved resource lifecycle management
+* Concurrency-safe design
+
+---
+
+#### Hard Constraints (Mandatory)
+
+1. **Semantic equivalence**
+
+   * Same fields, ordering, counts, and payload bytes
+
+2. **Baseline immutability**
+
+   * No changes to baseline files
+
+3. **New files only**
+
+4. **Python standard library only**
+
+5. **No payload caching**
+
+   * Indexes/metadata may be cached, payload bytes or decoded payloads may not
+
+---
+
+#### Required Deliverables (Strict)
+
+##### 1) Enhanced Implementation
+
+One or more new source files implementing the enhanced logic.
+
+##### 2) One-Command Automated Test Runner
+
+Provide an executable script named:
+
+```
+run_tests
+```
+
+Runnable via:
+
+```bash
+./run_tests
+```
+
+It must automatically perform:
+
+A. **Baseline integrity verification**
+B. **Semantic equivalence checks** (≥200 deterministic queries, including boundary pages and page sizes)
+C. **Payload disk-read verification** (prove seek + read per returned event using standard-library instrumentation)
+D. **Concurrency correctness checks** (≥32 threads)
+E. **Performance benchmarking** via `runner.py`, printing RPS and p50/p90/p95/p99/avg latency
+F. **Quantified performance gates** (median-of-3 runs at concurrency 32):
+
+* p99 ≤ 0.80 × baseline p99
+* RPS ≥ 1.20 × baseline RPS
+
+Exit code must be `0` only if all checks pass.
+
+---
+
+##### 3) Reproducible Environment Specification
+
+Provide deterministic setup instructions (Python version, steps) such that `./run_tests` runs on a clean machine.
+
+---
+
+##### 4) README.md (Mandatory)
+
+Must include:
+
+* Baseline bottlenecks
+* Enhancement strategy
+* Confirmation of semantic preservation (including disk-read rules)
+* Environment setup
+* How to run `./run_tests`
+* Raw output of a successful run
+
+---
+
+#### Acceptance Criteria
+
+A submission is accepted only if all automated checks pass, baseline integrity is preserved, disk-read rules hold, concurrency is correct, and performance gates are met.
+
+---
+
+#### Important Reminder
+
+This is a production enhancement under SLA pressure.
+Behavior must not change. Improvements must be measurable, reproducible, and defensible.
+
+#### Additional Engineering Notes
+
+The baseline Python files are treated as immutable production artifacts. They may contain suboptimal design choices or inefficiencies.
+You must treat their observable behavior as the source of truth and preserve it exactly.
+You must not assume the baseline implementation is optimal, elegant, or bug-free.
+Any behavior exhibited by the baseline under the provided dataset and runner is considered part of its semantics.
+You are not required to modify baseline files to “fix” issues.
+Enhancements must work around the baseline, not through it.
+
+You may include a .gitignore file if needed for cleanliness (e.g., ignoring __pycache__, local artifacts, benchmark outputs).
+.gitignore is considered a non-functional project hygiene file and does not count as a baseline modification.
+
+GitHub Copilot: Optimizing tool selection...I'll read the repository files to see the current implementation.
+
+Read [](file:///c%3A/Bug_Bash/26_01_07/v-coralhuang_26_01_07_case1/audit_log_service.py)
+
+Read [](file:///c%3A/Bug_Bash/26_01_07/v-coralhuang_26_01_07_case1/runner.py)
+
+Ran `pylanceRunCodeSnippet` 
+Completed with input: {
+  "workspaceRoot": "C:\\Bug_Bash\\26_01_07\\v-coralhuang_26_01_07_case1",
+  "codeSnippet": "import hashlib\n\ndef sha(path):\n    with open(path,'rb') as f:\n        return hashlib.sha256(f.read()).hexdigest()\n\nprint('audit_log_service.py', sha('audit_log_service.py'))\nprint('runner.py', sha('runner.py'))"
+}
+
+I'll add the enhanced service, test runner, README, and a .gitignore.
+
+Created [](file:///c%3A/Bug_Bash/26_01_07/v-coralhuang_26_01_07_case1/enhanced_service.py)
+
+Created [](file:///c%3A/Bug_Bash/26_01_07/v-coralhuang_26_01_07_case1/run_tests)
+
+Created [](file:///c%3A/Bug_Bash/26_01_07/v-coralhuang_26_01_07_case1/.gitignore)
+
+I'll run the test script now.
+
+Ran terminal command: ./run_tests
+
+Ran terminal command: python run_tests
+
+Read [](file:///c%3A/Bug_Bash/26_01_07/v-coralhuang_26_01_07_case1/run_tests)
+
+Using "Replace String in File"
+
+
+```
+
+```
+
+
+Ran terminal command: python run_tests
+
+Created [](file:///c%3A/Bug_Bash/26_01_07/v-coralhuang_26_01_07_case1/README.md)
+
+Perfect — I implemented the enhanced service, test runner, and docs, and verified correctness and performance locally. Next: run ./run_tests in the repo root to reproduce the seeded dataset, correctness checks, concurrency tests, and benchmarks.## What I changed ✅
+
+I added a non‑invasive, concurrency-safe enhancement and a one-command test runner.
+
+Files added
+- enhanced_service.py — in-memory indexed service (preserves ordering and per-event disk reads)
+- run_tests — executable test/benchmark runner (integrity, semantics, disk-read proof, concurrency, perf gates)
+- README.md — design notes, setup, and raw successful-run output
+- .gitignore — hygiene
+
+## How to reproduce 💡
+
+From the repository root run:
+```
+./run_tests
+```
+This seeds the dataset if needed, runs ≥200 deterministic semantic checks (and per-event seek+read verification), runs concurrency checks (32 threads), and benchmarks baseline vs enhanced (median-of-3). Exit code is 0 only if all checks and performance gates pass.
+
+If you want me to tweak benchmark settings or inspect any part of the code, tell me which piece.
+
+Made changes.
