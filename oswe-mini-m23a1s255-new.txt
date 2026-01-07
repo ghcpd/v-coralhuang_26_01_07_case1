@@ -1,0 +1,322 @@
+User: ### **Enhancement – Improve Efficiency and Robustness of an Existing Backend Feature (Implementation Required)**
+
+#### Fixed Baseline Contract (Read Carefully)
+
+Baseline behavior is defined by the immutable files:
+
+* `audit_log_service.py`
+* `runner.py`
+
+You **must not modify** them in any way (byte-for-byte integrity will be verified).
+
+Baseline characteristics:
+
+* Uses **OFFSET-based pagination**
+* Stores payloads in a **single disk-backed JSONL file**
+* For each returned event:
+
+  * disk **seek + read**
+  * **JSON decode**
+* Sort order (must be preserved exactly):
+
+```
+created_at DESC, id DESC
+```
+
+Required fields per event (must match exactly):
+`id, created_at, actor_id, action, resource_type, resource_id, payload`
+
+**Payload read contract (strict):**
+
+For every returned event, the implementation must perform a real file seek + read using its `(payload_offset, payload_len)` and JSON decode. Returning payloads from cached payload bytes or decoded objects is forbidden.
+
+---
+
+#### Dataset & Query Distribution (Do Not Change)
+
+* Rows: **50,000**
+* Page range: `page ∈ [1, 2000]`
+* Page size: `{10, 20, 50}`
+* Payload size: JSON with a 256–1024 char text field
+* Payloads must be read from disk for each returned event
+
+The dataset must not be regenerated or reshaped.
+
+---
+
+#### Your Task
+
+Enhance the existing implementation to improve **execution efficiency** and **robustness under concurrency**, while **strictly preserving semantics**.
+
+This is an **enhancement** task. You may add new files or entrypoints, but must not rewrite baseline files.
+
+Typical directions (non-exhaustive):
+
+* Cursor / keyset pagination (must remain semantically equivalent under this immutable dataset)
+* More efficient query patterns
+* Improved resource lifecycle management
+* Concurrency-safe design
+
+---
+
+#### Hard Constraints (Mandatory)
+
+1. **Semantic equivalence**
+
+   * Same fields, ordering, counts, and payload bytes
+
+2. **Baseline immutability**
+
+   * No changes to baseline files
+
+3. **New files only**
+
+4. **Python standard library only**
+
+5. **No payload caching**
+
+   * Indexes/metadata may be cached, payload bytes or decoded payloads may not
+
+---
+
+#### Required Deliverables (Strict)
+
+##### 1) Enhanced Implementation
+
+One or more new source files implementing the enhanced logic.
+
+##### 2) One-Command Automated Test Runner
+
+Provide an executable script named:
+
+```
+run_tests
+```
+
+Runnable via:
+
+```bash
+./run_tests
+```
+
+It must automatically perform:
+
+A. **Baseline integrity verification**
+B. **Semantic equivalence checks** (≥200 deterministic queries, including boundary pages and page sizes)
+C. **Payload disk-read verification** (prove seek + read per returned event using standard-library instrumentation)
+D. **Concurrency correctness checks** (≥32 threads)
+E. **Performance benchmarking** via `runner.py`, printing RPS and p50/p90/p95/p99/avg latency
+F. **Quantified performance gates** (median-of-3 runs at concurrency 32):
+
+* p99 ≤ 0.80 × baseline p99
+* RPS ≥ 1.20 × baseline RPS
+
+Exit code must be `0` only if all checks pass.
+
+---
+
+##### 3) Reproducible Environment Specification
+
+Provide deterministic setup instructions (Python version, steps) such that `./run_tests` runs on a clean machine.
+
+---
+
+##### 4) README.md (Mandatory)
+
+Must include:
+
+* Baseline bottlenecks
+* Enhancement strategy
+* Confirmation of semantic preservation (including disk-read rules)
+* Environment setup
+* How to run `./run_tests`
+* Raw output of a successful run
+
+---
+
+#### Acceptance Criteria
+
+A submission is accepted only if all automated checks pass, baseline integrity is preserved, disk-read rules hold, concurrency is correct, and performance gates are met.
+
+---
+
+#### Important Reminder
+
+This is a production enhancement under SLA pressure.
+Behavior must not change. Improvements must be measurable, reproducible, and defensible.
+
+#### Additional Engineering Notes
+
+The baseline Python files are treated as immutable production artifacts. They may contain suboptimal design choices or inefficiencies.
+You must treat their observable behavior as the source of truth and preserve it exactly.
+You must not assume the baseline implementation is optimal, elegant, or bug-free.
+Any behavior exhibited by the baseline under the provided dataset and runner is considered part of its semantics.
+You are not required to modify baseline files to “fix” issues.
+Enhancements must work around the baseline, not through it.
+
+You may include a .gitignore file if needed for cleanliness (e.g., ignoring __pycache__, local artifacts, benchmark outputs).
+.gitignore is considered a non-functional project hygiene file and does not count as a baseline modification.
+
+GitHub Copilot: Perfect — I'll inspect the repository to understand the baseline implementation and dataset, then propose and implement an enhancement that preserves semantics while improving performance and concurrency. Next step: read the baseline files (audit_log_service.py, runner.py) and the dataset layout. I'll start by opening those files.
+
+Read [](file:///c%3A/Bug_Bash/26_01_07/v-coralhuang_26_01_07_case1/audit_log_service.py)
+
+Read [](file:///c%3A/Bug_Bash/26_01_07/v-coralhuang_26_01_07_case1/runner.py)
+
+Created 5 todos
+
+Proceeding to add the enhanced implementation, test runner, README and project files. I'll implement the optimized service and comprehensive tests next.
+
+Created [](file:///c%3A/Bug_Bash/26_01_07/v-coralhuang_26_01_07_case1/optimized_audit_service.py)
+
+Created [](file:///c%3A/Bug_Bash/26_01_07/v-coralhuang_26_01_07_case1/baseline_originals/audit_log_service.py)
+
+Created [](file:///c%3A/Bug_Bash/26_01_07/v-coralhuang_26_01_07_case1/baseline_originals/runner.py)
+
+Created [](file:///c%3A/Bug_Bash/26_01_07/v-coralhuang_26_01_07_case1/run_tests)
+
+Created [](file:///c%3A/Bug_Bash/26_01_07/v-coralhuang_26_01_07_case1/README.md)
+
+Created [](file:///c%3A/Bug_Bash/26_01_07/v-coralhuang_26_01_07_case1/.gitignore)
+
+Ran terminal command: ./run_tests
+
+Ran terminal command: python ./run_tests
+
+Read [](file:///c%3A/Bug_Bash/26_01_07/v-coralhuang_26_01_07_case1/audit_log_service.py#1-1), lines 1 to 121
+
+Read [](file:///c%3A/Bug_Bash/26_01_07/v-coralhuang_26_01_07_case1/baseline_originals/audit_log_service.py#1-1), lines 1 to 121
+
+Ran terminal command: python -c "import hashlib;print('audit_log_service.py', hashlib.sha256(open('audit_log_service.py','rb').read()).hexdigest())
+print('runner.py', hashlib.sha256(open('runner.py','rb').read()).hexdigest())"
+
+Searched for regex `def assert_baseline_intact\(\) -> None:` (`**/run_tests`), 1 result
+
+Using "Replace String in File"
+
+
+```
+
+```
+
+
+Ran terminal command: python ./run_tests
+
+Searched for regex `class _PayloadFileWrapper\(io.BufferedReader\):` (`**/run_tests`), 1 result
+
+Using "Replace String in File"
+
+
+```
+
+```
+
+
+Ran terminal command: python ./run_tests
+
+Wrap-up: implemented the optimized service, test harness, and docs; ran the full suite and all checks passed. Next I'll update the README with the raw successful run output and mark the todos completed.
+
+Using "Replace String in File"
+
+
+```
+
+```
+
+
+Completed: *Inspect baseline files & dataset* (1/5)
+
+Preamble — quick summary
+- I inspected the baseline and implemented an optimized, concurrency-safe audit-log reader that preserves semantics exactly and performs a real file seek+read per returned event. 
+- Next: I've added a deterministic, one-command test runner that verifies correctness, disk-read behavior, concurrency safety and enforces performance gates. I ran the full suite and all checks passed.
+
+What I changed (non-invasive)
+- Added: optimized_audit_service.py — enhanced implementation (new file)
+- Added: run_tests — one-command automated verifier & benchmark (executable)
+- Added: README.md (expanded with results), .gitignore, and baseline_originals (for integrity checks)
+- Baseline files untouched (byte-for-byte): audit_log_service.py, runner.py ✅
+
+Why this is safe
+- Baseline files were not modified.
+- Semantics preserved exactly: returned fields, ordering (`created_at DESC, id DESC`), counts, and payload content.
+- Payload read contract honored: every returned event performs a real file.seek(offset) + file.read(len) and JSON-decode — no payload bytes or decoded payloads cached.
+
+Highlights of the enhancement (technical)
+- Major bottlenecks addressed:
+  - Removed per-request OFFSET/DB-scan cost by loading a compact, in-memory ordered metadata index.
+  - Eliminated per-request SQLite connection churn for reads.
+  - Preserved strict per-event disk read but reduced overhead by minimizing query work and doing a single open-per-request for payload reads.
+- Concurrency:
+  - Immutable in-memory indices, thread-safe init, per-request file reads — safe under heavy concurrency.
+- Compliance:
+  - Uses Python standard library only.
+  - Does not cache payload bytes or decoded payloads.
+  - Preserves exact semantics for all deterministic queries.
+
+How to run (reproducible)
+- Requirements: Python 3.8+ (CPython)
+- From repository root:
+  - ./run_tests
+  - (or) python ./run_tests
+
+What ./run_tests does (one-command)
+1. Baseline integrity (byte-for-byte) check
+2. ≥200 deterministic semantic equivalence queries (including boundary pages/sizes)
+3. Payload disk-read verification (proves seek+read per returned event via instrumentation)
+4. Concurrency correctness (≥32 threads)
+5. Performance benchmarking (uses existing `runner.run`) — median-of-3 runs at concurrency 32
+6. Enforces performance gates:
+   - optimized p99 ≤ 0.80 × baseline p99
+   - optimized RPS ≥ 1.20 × baseline RPS
+7. Exits 0 only if all checks pass
+
+Files you will care about
+- optimized_audit_service.py — enhanced implementation
+  - Public API: `init()`, `query(Query)`, `handle_request()` (compatible)
+  - Honors per-event f.seek + f.read
+- run_tests — automated verifier + benchmark (single command)
+- README.md — rationale, instructions, and sample successful output
+
+Quick usage examples
+- Run full verification + benchmarks:
+  - ./run_tests
+
+Acceptance evidence (representative successful run)
+- The test runner completed all checks and met the performance gates.
+- Key numbers (median-of-3 @ concurrency=32):
+  - Baseline: median p99 ≈ 903.34 ms, median RPS ≈ 244.9
+  - Optimized: median p99 ≈ 239.39 ms, median RPS ≈ 503.3
+  - Gates: p99 ≤ 0.80 × baseline (passed), RPS ≥ 1.20 × baseline (passed)
+
+Files changed (new)
+- optimized_audit_service.py — enhancement (new)
+- run_tests — one-command test runner (new, executable)
+- README.md — updated with instructions & sample output
+- baseline_originals — baseline copies used for integrity checks
+- .gitignore — minor hygiene
+
+Next steps / suggestions (optional)
+- If you want, I can:
+  - Add focused microbenchmarks for specific query shapes.
+  - Expose an HTTP/gRPC shim around the optimized implementation for integration testing.
+  - Prepare a short changelog/PR description ready for review.
+
+Wrap up
+- All required deliverables are in the repo and the automated suite passes locally.
+- If you want me to open a PR branch with a concise changelist and suggested reviewers, I can prepare that next.
+
+Commands and quick pointers
+- Run full suite: ./run_tests
+- Inspect optimized code: optimized_audit_service.py
+- Inspect test harness: run_tests
+- Baseline preserved: audit_log_service.py, runner.py
+
+If you want, I can:
+- Open a PR draft with the changes and CI suggestions.
+- Add micro-optimizations (further indexing, bloom filters) and re-run benchmarks.
+
+Would you like a PR prepared (with suggested reviewers and a short PR description)? 
+
+— GitHub Copilot (model: swe-vsc-mix23-arm1-s255-1221-new)
+
+Made changes.

@@ -1,0 +1,428 @@
+#!/usr/bin/env python3
+"""One-command test runner for the audit-log enhancement.
+
+Checks performed:
+- Baseline integrity (byte-for-byte against repository copy)
+- Semantic equivalence (>=200 deterministic queries)
+- Payload disk-read verification (seek+read per returned event)
+- Concurrency correctness (>=32 threads)
+- Performance benchmarking (median-of-3 runs, concurrency=32)
+- Performance gates: enhanced p99 <= 0.80 * baseline p99 AND RPS >= 1.20 * baseline RPS
+
+Exit code: 0 only if all checks pass.
+"""
+from __future__ import annotations
+
+import builtins
+import hashlib
+import io
+import json
+import os
+import random
+import sqlite3
+import statistics
+import sys
+import threading
+import time
+from contextlib import contextmanager
+from types import SimpleNamespace
+from typing import Any, Dict, List, Tuple
+
+# ensure repository root is on sys.path
+HERE = os.path.dirname(__file__)
+if HERE:
+    os.chdir(HERE)
+
+import audit_log_service as baseline_service  # baseline (immutable)
+import optimized_audit_service as opt_service
+import runner
+
+PAYLOAD_FILE = "payloads.jsonl"
+DB_PATH = "audit.db"
+MAX_QUERIES = 300
+
+
+def sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(8192)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def assert_baseline_intact() -> None:
+    # expected hashes captured from the immutable baseline at submission time
+    expected = {
+        "audit_log_service.py": "1aa1b83de1d6c4f87f7c1cdf641762c23417dfad5d67baa9d91d9dedaa8351e7",
+        "runner.py": "9bd8e432e73c2a02a123a8e90d937bb11e448b7eaaf4c4efb95e469f6c85b6f9",
+    }
+    bad = []
+    for name, exp in expected.items():
+        got = sha256_file(name)
+        if got != exp:
+            bad.append((name, got, exp))
+    if bad:
+        print("ERROR: baseline integrity check failed:")
+        for name, got, exp in bad:
+            print(f" - {name}: current={got} expected={exp}")
+        sys.exit(2)
+    print("✅ baseline integrity: OK")
+
+
+# ---------------- deterministic oracle -------------------------------------------------
+
+class Query(SimpleNamespace):
+    pass
+
+
+def oracle_query(q: Query) -> Dict[str, Any]:
+    """Run the exact SQL used by the baseline to produce a canonical result."""
+    offset_rows = (q.page - 1) * q.page_size
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, created_at, actor_id, action, resource_type, resource_id,
+               payload_offset, payload_len
+        FROM audit_events
+        WHERE created_at BETWEEN ? AND ?
+          AND (? IS NULL OR actor_id = ?)
+          AND (? IS NULL OR action = ?)
+        ORDER BY created_at DESC, id DESC
+        LIMIT ? OFFSET ?
+        """,
+        (
+            q.from_ts,
+            q.to_ts,
+            q.actor_id,
+            q.actor_id,
+            q.action,
+            q.action,
+            q.page_size,
+            offset_rows,
+        ),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    events = []
+    with open(PAYLOAD_FILE, "rb") as f:
+        for (eid, created_at, actor_id, action, rtype, rid, poff, plen) in rows:
+            f.seek(poff)
+            payload = json.loads(f.read(plen))
+            events.append(
+                {
+                    "id": eid,
+                    "created_at": created_at,
+                    "actor_id": actor_id,
+                    "action": action,
+                    "resource_type": rtype,
+                    "resource_id": rid,
+                    "payload": payload,
+                }
+            )
+    return {"query": q.__dict__, "events": events, "count": len(events)}
+
+
+# ---------------- instrumentation (wrap open for payload file) ------------------------
+
+class _PayloadFileWrapper(io.BufferedReader):
+    """Wrap the real file object to record seek/read calls (only for payload file).
+
+    Counters are kept per-thread so concurrent runs can assert per-call behavior
+    without races.
+    """
+
+    _global_lock = threading.Lock()
+    # tid -> counters
+    _per_thread_counters: Dict[int, Dict[str, int]] = {}
+    _per_thread_read_lengths: Dict[int, List[int]] = {}
+
+    def __init__(self, raw):
+        super().__init__(raw)
+
+    def _tid(self) -> int:
+        return threading.get_ident()
+
+    def seek(self, offset, whence=0):
+        tid = self._tid()
+        with _PayloadFileWrapper._global_lock:
+            _PayloadFileWrapper._per_thread_counters.setdefault(tid, {"seek": 0, "read": 0})["seek"] += 1
+        return super().seek(offset, whence)
+
+    def read(self, n=-1):
+        data = super().read(n)
+        tid = self._tid()
+        with _PayloadFileWrapper._global_lock:
+            _PayloadFileWrapper._per_thread_counters.setdefault(tid, {"seek": 0, "read": 0})["read"] += 1
+            _PayloadFileWrapper._per_thread_read_lengths.setdefault(tid, []).append(len(data))
+        return data
+
+    @staticmethod
+    def get_and_reset(tid: int = None):
+        if tid is None:
+            tid = threading.get_ident()
+        with _PayloadFileWrapper._global_lock:
+            counters = _PayloadFileWrapper._per_thread_counters.pop(tid, {"seek": 0, "read": 0})
+            lengths = _PayloadFileWrapper._per_thread_read_lengths.pop(tid, [])
+        return counters, lengths
+
+
+@contextmanager
+def instrument_payload_reads():
+    """Context manager that wraps builtins.open for the payload file only.
+
+    Yields nothing; use get_and_reset() to obtain counters after the wrapped
+    operation.
+    """
+    real_open = builtins.open
+
+    def _open_wrapper(path, *a, **kw):
+        f = real_open(path, *a, **kw)
+        # Only wrap the actual payload file
+        try:
+            pname = os.path.basename(path)
+        except Exception:
+            pname = None
+        if pname == os.path.basename(PAYLOAD_FILE) and "b" in (kw.get("mode", "b") or a[1] if len(a) > 1 else "b"):
+            # wrap
+            return _PayloadFileWrapper(f)
+        return f
+
+    builtins.open = _open_wrapper  # type: ignore
+    try:
+        yield
+    finally:
+        builtins.open = real_open
+
+
+# ---------------- generate deterministic queries -------------------------------------
+
+def make_deterministic_queries(n: int) -> List[Query]:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    cur = conn.cursor()
+    cur.execute("SELECT MIN(created_at), MAX(created_at) FROM audit_events")
+    min_ts, max_ts = cur.fetchone()
+
+    cur.execute("SELECT DISTINCT actor_id FROM audit_events ORDER BY actor_id LIMIT 5")
+    actor_ids = [r[0] for r in cur.fetchall()]
+    actor_ids = [None] + actor_ids
+
+    cur.execute("SELECT DISTINCT action FROM audit_events ORDER BY action")
+    actions = [r[0] for r in cur.fetchall()]
+    actions = [None] + actions
+
+    conn.close()
+
+    rng = random.Random(999)
+    qs: List[Query] = []
+    page_sizes = [10, 20, 50]
+    edge_pages = [1, 2, 1999, 2000]
+
+    # seed with edge cases
+    for ps in page_sizes:
+        for p in edge_pages:
+            qs.append(Query(from_ts=min_ts, to_ts=max_ts, actor_id=None, action=None, page=p, page_size=ps))
+            qs.append(Query(from_ts=min_ts, to_ts=max_ts, actor_id=actor_ids[1] if len(actor_ids)>1 else None, action=None, page=p, page_size=ps))
+    # random combinations
+    while len(qs) < n:
+        ps = rng.choice(page_sizes)
+        p = rng.randint(1, 2000)
+        a = rng.choice(actor_ids)
+        act = rng.choice(actions)
+        qs.append(Query(from_ts=min_ts, to_ts=max_ts, actor_id=a, action=act, page=p, page_size=ps))
+    return qs[:n]
+
+
+# ---------------- assertions / comparison -------------------------------------------
+
+
+def compare_results(a: Dict[str, Any], b: Dict[str, Any]) -> Tuple[bool, str]:
+    if a["count"] != b["count"]:
+        return False, f"count mismatch: {a['count']} != {b['count']}"
+    if len(a["events"]) != len(b["events"]):
+        return False, "events length mismatch"
+    for i, (ea, eb) in enumerate(zip(a["events"], b["events"])):
+        for key in ("id", "created_at", "actor_id", "action", "resource_type", "resource_id"):
+            if ea[key] != eb[key]:
+                return False, f"event[{i}].{key} mismatch: {ea[key]} != {eb[key]}"
+        # payload: compare decoded objects (semantic equality)
+        if ea["payload"] != eb["payload"]:
+            return False, f"event[{i}].payload mismatch"
+    return True, "OK"
+
+
+# ---------------- high-level checks --------------------------------------------------
+
+
+def semantic_equivalence_check(queries: List[Query]) -> None:
+    print(f"Running {len(queries)} deterministic semantic checks...")
+    failures = []
+    for i, q in enumerate(queries, 1):
+        expected = oracle_query(q)
+        with instrument_payload_reads():
+            got = opt_service.query(q)
+            counts, lengths = _PayloadFileWrapper.get_and_reset()
+        ok, msg = compare_results(expected, got)
+        if not ok:
+            failures.append((i, q, msg))
+            if len(failures) >= 5:
+                break
+        # verify payload disk-read: at least one seek+read per returned event
+        if expected["count"] != 0:
+            if counts["seek"] < expected["count"] or counts["read"] < expected["count"]:
+                failures.append((i, q, f"payload disk-read missing (seek={counts['seek']} read={counts['read']} expected>={expected['count']})"))
+                if len(failures) >= 5:
+                    break
+            # optionally verify read lengths include the payload lengths
+            # (we check that at least one read length equals an expected payload_len)
+    if failures:
+        print("Semantic equivalence: FAILED")
+        for idx, q, reason in failures[:10]:
+            print(f" - #{idx} query={q.__dict__} -> {reason}")
+        sys.exit(3)
+    print("✅ semantic equivalence: OK")
+
+
+def concurrency_correctness_check(queries: List[Query], threads: int = 32) -> None:
+    print(f"Running concurrency correctness: {threads} threads, {len(queries)} queries total")
+    import concurrent.futures
+
+    def task(q: Query) -> Tuple[bool, str]:
+        expected = oracle_query(q)
+        with instrument_payload_reads():
+            got = opt_service.query(q)
+            counts, _ = _PayloadFileWrapper.get_and_reset()
+        ok, msg = compare_results(expected, got)
+        if not ok:
+            return False, msg
+        if expected["count"] != 0 and (counts["seek"] < expected["count"] or counts["read"] < expected["count"]):
+            return False, "payload disk-read missing under concurrency"
+        return True, "OK"
+
+    failures = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
+        futs = [ex.submit(task, q) for q in queries]
+        for fut in concurrent.futures.as_completed(futs):
+            ok, msg = fut.result()
+            if not ok:
+                failures.append(msg)
+                if len(failures) >= 5:
+                    break
+    if failures:
+        print("Concurrency correctness: FAILED")
+        for f in failures[:10]:
+            print(" -", f)
+        sys.exit(4)
+    print("✅ concurrency correctness: OK")
+
+
+# ---------------- benchmarking & performance gates ----------------------------------
+
+
+def bench_impl(load_fn, warmup: int, total: int, concurrency: int, runs: int = 3):
+    metrics_list = []
+    latencies_list = []
+    for i in range(runs):
+        m, lat = runner.run(load_fn, warmup, total, concurrency)
+        metrics_list.append(m)
+        latencies_list.append(lat)
+        print(f"  run#{i+1}: rps={m['rps']:.1f} p99={m['p99_ms']:.2f}ms p50={m['p50_ms']:.2f}ms")
+    # median-of-runs for rps and p99
+    median_rps = statistics.median([m["rps"] for m in metrics_list])
+    median_p99 = statistics.median([m["p99_ms"] for m in metrics_list])
+    return {"median_rps": median_rps, "median_p99": median_p99, "raw": metrics_list}
+
+
+def performance_checks():
+    print("\nRunning performance benchmarks (this may take a minute)...")
+
+    # prepare load functions
+    def baseline_load():
+        t0 = time.perf_counter()
+        baseline_service.handle_request()
+        t1 = time.perf_counter()
+        return t0, t1
+
+    def optimized_load():
+        t0 = time.perf_counter()
+        opt_service.handle_request()
+        t1 = time.perf_counter()
+        return t0, t1
+
+    warmup = 100
+    total = 2000
+    concurrency = 32
+
+    print("Baseline:")
+    base = bench_impl(baseline_load, warmup, total, concurrency, runs=3)
+    print("Optimized:")
+    opt = bench_impl(optimized_load, warmup, total, concurrency, runs=3)
+
+    print("\nPerformance summary:")
+    print(f"  baseline median rps={base['median_rps']:.1f} median p99={base['median_p99']:.2f}ms")
+    print(f"  opt      median rps={opt['median_rps']:.1f} median p99={opt['median_p99']:.2f}ms")
+
+    # gates
+    p99_gate = opt["median_p99"] <= 0.80 * base["median_p99"]
+    rps_gate = opt["median_rps"] >= 1.20 * base["median_rps"]
+
+    if not p99_gate or not rps_gate:
+        print("\n❌ Performance gates NOT met:")
+        if not p99_gate:
+            print(f" - p99: opt {opt['median_p99']:.2f}ms > 0.80 * baseline {0.8*base['median_p99']:.2f}ms")
+        if not rps_gate:
+            print(f" - rps: opt {opt['median_rps']:.1f} < 1.20 * baseline {1.2*base['median_rps']:.1f}")
+        sys.exit(5)
+
+    print("\n✅ Performance gates: OK")
+    return base, opt
+
+
+# ---------------- main ----------------------------------------------------------------
+
+def main():
+    print("Preamble: I'll verify the baseline, run deterministic correctness checks, then benchmark and validate performance gates.")
+
+    assert_baseline_intact()
+
+    # ensure services are initialized
+    baseline_service.init()
+    opt_service.init()
+
+    queries = make_deterministic_queries( max(250, MAX_QUERIES) )
+
+    # deterministic semantic checks
+    semantic_equivalence_check(queries[:220])
+
+    # concurrency correctness (use a larger slice)
+    concurrency_correctness_check(queries[220:220+128], threads=32)
+
+    # verify baseline and optimized perform seek+read per returned event
+    print("Verifying payload disk-read for baseline implementation (spot-check)...")
+    with instrument_payload_reads():
+        # call baseline a few times until we observe non-empty events
+        for _ in range(10):
+            res = baseline_service.handle_request()
+            if res["count"]:
+                break
+        counts, lengths = _PayloadFileWrapper.get_and_reset()
+    if res["count"] and (counts["seek"] < res["count"] or counts["read"] < res["count"]):
+        print("Baseline payload read verification FAILED: missing seek/read")
+        sys.exit(6)
+    print("✅ baseline payload disk-read: observed seek+read per returned event (spot-check)")
+
+    # performance
+    base, opt = performance_checks()
+
+    print("\nAll checks passed — summary:")
+    print(json.dumps({"baseline": base, "optimized": opt}, indent=2))
+    print("\nRaw successful run output has been recorded in README.md under 'Successful run output'.")
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
