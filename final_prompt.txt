@@ -156,3 +156,7 @@ Enhancements must work around the baseline, not through it.
 
 You may include a .gitignore file if needed for cleanliness (e.g., ignoring __pycache__, local artifacts, benchmark outputs).
 .gitignore is considered a non-functional project hygiene file and does not count as a baseline modification.
+
+#### Critical Instruction
+
+When implementing the test runner, do not use inefficient polling approaches (like sleep commands to wait for tests to complete). Run tests in the foreground and wait for actual completion. Test performance comparisons must isolate the baseline (unpatched) from the enhanced (patched) implementation to ensure accurate measurements - consider using separate Python subprocesses for benchmarking to avoid module-level interference.

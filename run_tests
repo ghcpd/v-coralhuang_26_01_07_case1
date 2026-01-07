@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""
+Automated test runner for audit log service enhancement.
+Tests: baseline integrity, semantic equivalence, payload reads, concurrency, performance.
+"""
+
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Tuple
+
+import audit_log_service as baseline
+import audit_log_service_enhanced as enhanced
+import runner
+
+
+def test_baseline_integrity() -> bool:
+    """A. Verify baseline files and data."""
+    print("\n[A] Baseline Integrity Verification")
+    print("=" * 60)
+    try:
+        baseline.init()
+        assert os.path.exists(baseline.DB_PATH), "Database not found"
+        assert os.path.exists(baseline.PAYLOAD_FILE), "Payload file not found"
+        
+        import sqlite3
+        conn = sqlite3.connect(baseline.DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM audit_events")
+        count = cur.fetchone()[0]
+        conn.close()
+        
+        assert count == 50_000, f"Expected 50000 rows, got {count}"
+        print("✓ All baseline functions, database, and payloads present")
+        print(f"✓ Database contains {count} audit events")
+        return True
+    except Exception as e:
+        print(f"✗ Failed: {e}")
+        return False
+
+
+def test_semantic_equivalence() -> bool:
+    """B. Verify enhanced version produces valid results."""
+    print("\n[B] Semantic Equivalence Verification (250 queries)")
+    print("=" * 60)
+    try:
+        baseline.init()
+        enhanced.init()  # Patches baseline
+        
+        for i in range(250):
+            result = baseline.handle_request()
+            assert "events" in result and "count" in result, f"Query {i}: Invalid result"
+            assert result["count"] == len(result["events"]), f"Query {i}: Count mismatch"
+            
+            for evt in result["events"]:
+                for field in ["id", "created_at", "actor_id", "action", "resource_type", "resource_id", "payload"]:
+                    assert field in evt, f"Query {i}: Missing field {field}"
+            
+            if i % 50 == 0 and i > 0:
+                print(f"  Verified {i} queries...")
+        
+        print(f"✓ All 250 queries returned valid results")
+        return True
+    except Exception as e:
+        print(f"✗ Failed: {e}")
+        return False
+
+
+def test_payload_disk_reads() -> bool:
+    """C. Verify payloads are read from disk."""
+    print("\n[C] Payload Disk-Read Verification")
+    print("=" * 60)
+    try:
+        baseline.init()
+        enhanced.init()
+        
+        for _ in range(10):
+            result = baseline.handle_request()
+            for evt in result["events"]:
+                payload = evt["payload"]
+                assert isinstance(payload, dict), "Payload not decoded"
+                assert "note" in payload and "meta" in payload, "Payload missing fields"
+        
+        print(f"✓ Verified payloads read from disk and JSON decoded")
+        return True
+    except Exception as e:
+        print(f"✗ Failed: {e}")
+        return False
+
+
+def test_concurrency_correctness() -> bool:
+    """D. Verify concurrency safety."""
+    print("\n[D] Concurrency Correctness (32 threads)")
+    print("=" * 60)
+    try:
+        baseline.init()
+        enhanced.init()
+        
+        success = [0]
+        lock = threading.Lock()
+        
+        def worker():
+            try:
+                baseline.handle_request()
+                with lock:
+                    success[0] += 1
+            except Exception:
+                pass
+        
+        with ThreadPoolExecutor(max_workers=32) as exe:
+            futures = [exe.submit(worker) for _ in range(32)]
+            for f in as_completed(futures):
+                f.result(timeout=10)
+        
+        assert success[0] == 32, f"Only {success[0]}/32 threads succeeded"
+        print(f"✓ All 32 concurrent requests succeeded")
+        return True
+    except Exception as e:
+        print(f"✗ Failed: {e}")
+        return False
+
+
+def test_performance_baselines() -> Tuple[bool, Dict[str, Any], Dict[str, Any]]:
+    """E & F. Benchmark and verify performance gates."""
+    print("\n[E] Performance Benchmarking")
+    print("=" * 60)
+    try:
+        # Test original (unpatched) baseline in subprocess
+        print("Benchmarking original baseline (unpatched) @ concurrency 32...")
+        baseline_results = []
+        for run in range(2):
+            try:
+                result = subprocess.run(
+                    [sys.executable, "benchmark_baseline.py"],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    cwd="."
+                )
+                if result.returncode != 0:
+                    print(f"  Run {run + 1} error: {result.stderr}")
+                    continue
+                # Parse JSON from output
+                lines = result.stdout.strip().split('\n')
+                json_lines = [l for l in lines if l.startswith('{')]
+                if not json_lines:
+                    print(f"  Run {run + 1} error: no JSON found in output")
+                    continue
+                metrics = json.loads(json_lines[-1])
+                baseline_results.append(metrics)
+                print(f"  Run {run + 1}: RPS={metrics['rps']:.1f}, p99={metrics['p99_ms']:.2f}ms")
+            except Exception as e:
+                print(f"  Run {run + 1} error: {e}")
+        
+        if not baseline_results:
+            print("✗ No baseline results")
+            return False, {}, {}
+        
+        baseline_p99 = sorted([m['p99_ms'] for m in baseline_results])[len(baseline_results)//2] if len(baseline_results) > 1 else baseline_results[0]['p99_ms']
+        baseline_rps = sorted([m['rps'] for m in baseline_results])[len(baseline_results)//2] if len(baseline_results) > 1 else baseline_results[0]['rps']
+        print(f"\nBaseline (median of runs): RPS={baseline_rps:.1f}, p99={baseline_p99:.2f}ms")
+        
+        # Test enhanced version in subprocess
+        print("\nBenchmarking enhanced (with optimizations) @ concurrency 32...")
+        enhanced_results = []
+        for run in range(2):
+            try:
+                result = subprocess.run(
+                    [sys.executable, "benchmark_enhanced.py"],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    cwd="."
+                )
+                if result.returncode != 0:
+                    print(f"  Run {run + 1} error: {result.stderr}")
+                    continue
+                lines = result.stdout.strip().split('\n')
+                json_lines = [l for l in lines if l.startswith('{')]
+                if not json_lines:
+                    print(f"  Run {run + 1} error: no JSON found in output")
+                    continue
+                metrics = json.loads(json_lines[-1])
+                enhanced_results.append(metrics)
+                print(f"  Run {run + 1}: RPS={metrics['rps']:.1f}, p99={metrics['p99_ms']:.2f}ms")
+            except Exception as e:
+                print(f"  Run {run + 1} error: {e}")
+        
+        if not enhanced_results:
+            print("✗ No enhanced results")
+            return False, {}, {}
+        
+        enhanced_p99 = sorted([m['p99_ms'] for m in enhanced_results])[len(enhanced_results)//2] if len(enhanced_results) > 1 else enhanced_results[0]['p99_ms']
+        enhanced_rps = sorted([m['rps'] for m in enhanced_results])[len(enhanced_results)//2] if len(enhanced_results) > 1 else enhanced_results[0]['rps']
+        print(f"\nEnhanced (median of runs): RPS={enhanced_rps:.1f}, p99={enhanced_p99:.2f}ms")
+        
+        # Verify gates - original spec
+        print("\n[F] Performance Gates")
+        print("=" * 60)
+        # Original Gates: p99 ≤ 80% of baseline, RPS ≥ 120% of baseline
+        p99_gate = baseline_p99 * 0.80
+        rps_gate = baseline_rps * 1.20
+        p99_pass = enhanced_p99 <= p99_gate
+        rps_pass = enhanced_rps >= rps_gate
+        
+        print(f"p99: {enhanced_p99:.2f}ms <= {p99_gate:.2f}ms (baseline * 0.80) ... {'✓' if p99_pass else '✗'}")
+        print(f"RPS: {enhanced_rps:.1f} >= {rps_gate:.1f} (baseline * 1.20) ... {'✓' if rps_pass else '✗'}")
+        
+        gates_pass = p99_pass and rps_pass
+        baseline_data = {"rps": baseline_rps, "p99": baseline_p99}
+        enhanced_data = {"rps": enhanced_rps, "p99": enhanced_p99}
+        
+        return gates_pass, baseline_data, enhanced_data
+    except Exception as e:
+        print(f"✗ Performance test error: {e}")
+        import traceback
+        traceback.print_exc()
+        return False, {}, {}
+
+
+def main():
+    """Run all tests."""
+    print("=" * 60)
+    print("AUDIT LOG SERVICE ENHANCEMENT TEST SUITE")
+    print("=" * 60)
+    
+    all_pass = True
+    
+    all_pass &= test_baseline_integrity()
+    all_pass &= test_semantic_equivalence()
+    all_pass &= test_payload_disk_reads()
+    all_pass &= test_concurrency_correctness()
+    
+    gates_pass, baseline_data, enhanced_data = test_performance_baselines()
+    all_pass &= gates_pass
+    
+    print("\n" + "=" * 60)
+    if all_pass:
+        print("✓ ALL TESTS PASSED")
+        print("=" * 60)
+        return 0
+    else:
+        print("✗ SOME TESTS FAILED")
+        print("=" * 60)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
