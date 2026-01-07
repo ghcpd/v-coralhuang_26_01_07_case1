@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+"""Run automated checks for enhanced audit log service.
+
+Checks performed:
+- Baseline integrity verification (SHA256 of baseline files)
+- Semantic equivalence checks (>=200 deterministic queries)
+- Payload seek+read verification (per-event)
+- Concurrency correctness checks (>=32 threads)
+- Performance benchmarking via runner.run (median-of-3 runs)
+
+Exit code is 0 only if all checks pass.
+"""
+from __future__ import annotations
+
+import builtins
+ORIGINAL_OPEN = builtins.open
+import hashlib
+import json
+import os
+import statistics
+import sys
+import threading
+import time
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Tuple
+
+import sqlite3
+import audit_log_service as baseline
+import enhanced_audit_service as enhanced
+import runner
+
+# Expected baseline file hashes (computed at submission time)
+EXPECTED_HASHES = {
+    "audit_log_service.py": "1aa1b83de1d6c4f87f7c1cdf641762c23417dfad5d67baa9d91d9dedaa8351e7",
+    "runner.py": "9bd8e432e73c2a02a123a8e90d937bb11e448b7eaaf4c4efb95e469f6c85b6f9",
+}
+
+
+def sha256_of_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(8192)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+class InstrumentedFile:
+    """Wrap a binary file and record seek/read operations."""
+
+    def __init__(self, f, recorder: Dict[str, List[Tuple[int, int]]]):
+        self._f = f
+        self._rec = recorder
+
+    def seek(self, offset, whence=0):
+        res = self._f.seek(offset, whence)
+        # record seeks; store last seek position
+        self._rec.setdefault("seeks", []).append((self._f.tell(), offset))
+        return res
+
+    def read(self, n=-1):
+        data = self._f.read(n)
+        self._rec.setdefault("reads", []).append((len(data), n))
+        return data
+
+    def __getattr__(self, name):
+        return getattr(self._f, name)
+
+    def close(self):
+        try:
+            self._f.close()
+        except Exception:
+            pass
+
+
+class InstrumentedOpen:
+    """Context manager / callable to replace builtins.open for instrumentation."""
+
+    def __init__(self, path: str, mode: str, recorder: Dict[str, List[Tuple[int, int]]]):
+        self.path = path
+        self.mode = mode
+        self.rec = recorder
+
+    def __call__(self, path, mode="rb", *args, **kwargs):
+        assert path == self.path
+        f = self._real_open(path, mode, *args, **kwargs)
+        return InstrumentedFile(f, self.rec)
+
+    def __enter__(self):
+        f = self._real_open(self.path, self.mode)
+        return InstrumentedFile(f, self.rec)
+
+    def __exit__(self, exc_type, exc, tb):
+        pass
+
+    @staticmethod
+    def _real_open(path, mode, *args, **kwargs):
+        return ORIGINAL_OPEN(path, mode, *args, **kwargs)
+
+
+def baseline_expected_for_query(q: baseline.Query, seek_recorder: Dict) -> Dict[str, Any]:
+    """Compute baseline expected result for Query q and record seek/read ops."""
+    # replicate baseline SQL
+    offset_rows = (q.page - 1) * q.page_size
+    conn = sqlite3.connect(baseline.DB_PATH, check_same_thread=False)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, created_at, actor_id, action, resource_type, resource_id,
+               payload_offset, payload_len
+        FROM audit_events
+        WHERE created_at BETWEEN ? AND ?
+          AND (? IS NULL OR actor_id = ?)
+          AND (? IS NULL OR action = ?)
+        ORDER BY created_at DESC, id DESC
+        LIMIT ? OFFSET ?
+        """,
+        (
+            q.from_ts,
+            q.to_ts,
+            q.actor_id,
+            q.actor_id,
+            q.action,
+            q.action,
+            q.page_size,
+            offset_rows,
+        ),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    events = []
+    # instrument payload file during baseline reads
+    for (eid, created_at, actor_id, action, rtype, rid, poff, plen) in rows:
+        with InstrumentedOpen(baseline.PAYLOAD_FILE, "rb", seek_recorder) as f:
+            # read exact slice
+            f.seek(poff)
+            raw = f.read(plen)
+            payload = json.loads(raw)
+        events.append(
+            {
+                "id": eid,
+                "created_at": created_at,
+                "actor_id": actor_id,
+                "action": action,
+                "resource_type": rtype,
+                "resource_id": rid,
+                "payload": payload,
+            }
+        )
+
+    return {"query": q.__dict__, "events": events, "count": len(events)}
+
+
+def compare_results(expected: Dict[str, Any], actual: Dict[str, Any]) -> Tuple[bool, str]:
+    if expected["count"] != actual["count"]:
+        return False, f"count mismatch: {expected['count']} != {actual['count']}"
+    for e, a in zip(expected["events"], actual["events"]):
+        for k in ("id", "created_at", "actor_id", "action", "resource_type", "resource_id"):
+            if e[k] != a[k]:
+                return False, f"field {k} mismatch: {e[k]} != {a[k]}"
+        if e["payload"] != a["payload"]:
+            return False, f"payload mismatch for id {e['id']}"
+    return True, ""
+
+
+def run_semantic_checks(num_queries: int = 300) -> bool:
+    print("Running semantic equivalence checks...")
+    baseline.init()  # ensure seeded
+    enhanced.init()
+
+    # deterministic queries generated by baseline._pick_query
+    queries = [baseline._pick_query() for _ in range(num_queries)]
+
+    # add boundary cases
+    queries.append(baseline.Query(from_ts=0, to_ts=int(time.time()), actor_id=None, action=None, page=1, page_size=50))
+    queries.append(baseline.Query(from_ts=0, to_ts=int(time.time()), actor_id=None, action=None, page=baseline.MAX_PAGE, page_size=10))
+
+    for i, q in enumerate(queries):
+        # instrument reads for baseline expected
+        seek_rec = {}
+        expected = baseline_expected_for_query(q, seek_rec)
+
+        # Now instrument builtins.open for enhanced run to capture seeks/reads
+        rec_enh = {}
+        orig_open = builtins.open
+        try:
+            # remove any cached payload file handle so enhanced re-opens it under instrumentation
+            if hasattr(enhanced._local, "pf"):
+                try:
+                    enhanced._local.pf.close()
+                except Exception:
+                    pass
+                delattr(enhanced._local, "pf")
+
+            builtins.open = InstrumentedOpen(baseline.PAYLOAD_FILE, "rb", rec_enh)
+            actual = enhanced.handle_query(q)
+        finally:
+            builtins.open = orig_open
+
+        ok, msg = compare_results(expected, actual)
+        if not ok:
+            print(f"Semantic mismatch on query #{i}: {msg}")
+            return False
+
+        # verify payload disk-read: for each returned event, there must be a seek+read
+        seeks = rec_enh.get("seeks", [])
+        reads = rec_enh.get("reads", [])
+        if len(seeks) < expected["count"] or len(reads) < expected["count"]:
+            print(f"Payload disk-read missing for query #{i}: seeks={len(seeks)}, reads={len(reads)}, events={expected['count']}")
+            return False
+
+    print("Semantic equivalence checks passed ✅")
+    return True
+
+
+def run_concurrency_checks(thread_count: int = 32, per_thread_ops: int = 50) -> bool:
+    print("Running concurrency correctness checks...")
+    enhanced.init()
+
+    # prepare deterministic queries
+    qs = [baseline._pick_query() for _ in range(thread_count * per_thread_ops)]
+
+    errors = []
+
+    # install a global instrumented open for the duration of the concurrency test
+    orig_open = builtins.open
+    def global_instrumented_open(path, mode='rb', *a, **kw):
+        # each call returns an InstrumentedFile with its own recorder dict
+        return InstrumentedFile(ORIGINAL_OPEN(path, mode, *a, **kw), recorder={})
+
+    builtins.open = global_instrumented_open
+
+    def worker(qs_slice):
+        for q in qs_slice:
+            # ensure per-thread cached file handle is cleared so open() is invoked under instrumentation
+            if hasattr(enhanced._local, "pf"):
+                try:
+                    enhanced._local.pf.close()
+                except Exception:
+                    pass
+                delattr(enhanced._local, "pf")
+
+            res = enhanced.handle_query(q)
+
+            pf = getattr(enhanced._local, "pf", None)
+            pf_reads = []
+            if pf is not None and hasattr(pf, "_rec"):
+                pf_reads = pf._rec.get("reads", [])
+
+            if len(pf_reads) < res["count"]:
+                pf_type = type(pf).__name__ if pf is not None else "<none>"
+                return (
+                    f"Missing reads for query page {q.page} (pf_reads={len(pf_reads)}, events={res['count']}, pf={pf_type})"
+                )
+        return None
+
+    try:
+        with ThreadPoolExecutor(max_workers=thread_count) as ex:
+            futs = []
+            per = per_thread_ops
+            for i in range(thread_count):
+                slice_qs = qs[i * per : (i + 1) * per]
+                futs.append(ex.submit(worker, slice_qs))
+            for fut in as_completed(futs):
+                r = fut.result()
+                if r:
+                    errors.append(r)
+    finally:
+        builtins.open = orig_open
+    if errors:
+        print("Concurrency errors:", errors[:5])
+        return False
+
+    print("Concurrency checks passed ✅")
+    return True
+
+
+def run_perf_benchmarks(concurrency: int = 32) -> bool:
+    print("Running performance benchmarks...")
+    warmup = 20
+    total = 400
+
+    def baseline_load():
+        t0 = time.perf_counter()
+        baseline.handle_request()
+        t1 = time.perf_counter()
+        return t0, t1
+
+    def enhanced_load():
+        t0 = time.perf_counter()
+        enhanced.handle_request()
+        t1 = time.perf_counter()
+        return t0, t1
+
+    def run_many(fn):
+        metrics_list = []
+        lat_lists = []
+        for _ in range(3):
+            m, l = runner.run(fn, warmup, total, concurrency)
+            metrics_list.append(m)
+            lat_lists.append(l)
+        # pick median run by p99
+        metrics_list.sort(key=lambda x: x["p99_ms"])
+        return metrics_list[1]
+
+    print("Benchmarking baseline...")
+    base_metrics = run_many(baseline_load)
+    print("Baseline metrics:", base_metrics)
+
+    print("Benchmarking enhanced...")
+    enh_metrics = run_many(enhanced_load)
+    print("Enhanced metrics:", enh_metrics)
+
+    # Performance gates
+    p99_gate = enh_metrics["p99_ms"] <= 0.80 * base_metrics["p99_ms"]
+    rps_gate = enh_metrics["rps"] >= 1.20 * base_metrics["rps"]
+
+    print(f"Baseline p99={base_metrics['p99_ms']:.2f}ms, enhanced p99={enh_metrics['p99_ms']:.2f}ms")
+    print(f"Baseline rps={base_metrics['rps']:.2f}, enhanced rps={enh_metrics['rps']:.2f}")
+
+    if not p99_gate:
+        print("Performance gate failed: p99 not improved enough")
+    if not rps_gate:
+        print("Performance gate failed: rps not improved enough")
+
+    if p99_gate and rps_gate:
+        print("Performance gates passed ✅")
+        return True
+    return False
+
+
+def main() -> int:
+    # 1) Baseline integrity
+    print("Verifying baseline file integrity...")
+    for fname, expect in EXPECTED_HASHES.items():
+        if not os.path.exists(fname):
+            print(f"Missing baseline file: {fname}")
+            return 2
+        h = sha256_of_file(fname)
+        if h != expect:
+            print(f"Baseline file hash mismatch for {fname}: {h} != {expect}")
+            return 3
+    print("Baseline integrity OK ✅")
+
+    # 2) Semantic checks
+    if not run_semantic_checks(300):
+        return 4
+
+    # 3) Concurrency
+    if not run_concurrency_checks(thread_count=32, per_thread_ops=25):
+        return 5
+
+    # 4) Performance
+    if not run_perf_benchmarks(concurrency=32):
+        return 6
+
+    print("All checks passed ✅")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
